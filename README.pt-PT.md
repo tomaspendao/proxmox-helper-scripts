@@ -1,3 +1,4 @@
+
 ---
 
 # 2) `README.pt-PT.md` (root – PT‑PT)
