@@ -1,7 +1,29 @@
 #!/usr/bin/env bash
+
+# ------------------------------------------------------------
+# AUTO-FIX: if this file contains HTML entities (&gt; &lt; &amp; etc),
+# unescape and re-run (prevents "script does nothing" scenarios).
+# ------------------------------------------------------------
+if grep -qE '&(gt|lt|amp|quot|apos|#39);' "$0" 2>/dev/null; then
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' "$0" | bash
+import sys, html
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+    data = f.read()
+print(html.unescape(data))
+PY
+    exit $?
+  else
+    # minimal fallback for common entities
+    sed -e 's/&gt;/>/g' -e 's/&lt;/</g' -e 's/&amp;/\&/g' "$0" | bash
+    exit $?
+  fi
+fi
+
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -72,7 +94,7 @@ DEF_DISK="20"
 DEF_STORAGE="local-lvm"
 
 # RomM defaults
-DEF_ROMM_PORT="8081"    # external port (container binds 8080 internally)
+DEF_ROMM_PORT="8081"           # external port (RomM binds 8080 internally)
 DEF_DB_NAME="romm"
 DEF_DB_USER="romm-user"
 
@@ -132,3 +154,162 @@ PRIVMODE=$(whiptail --title "Container security" --menu "Container type (Docker 
 
 ROMM_PORT=$(whiptail --title "RomM" --inputbox "Expose RomM on this port (external):" 10 70 "$DEF_ROMM_PORT" 3>&1 1>&2 2>&3) || exit 1
 
+DB_NAME=$(whiptail --title "Database" --inputbox "DB name:" 10 70 "$DEF_DB_NAME" 3>&1 1>&2 2>&3) || exit 1
+DB_USER=$(whiptail --title "Database" --inputbox "DB user:" 10 70 "$DEF_DB_USER" 3>&1 1>&2 2>&3) || exit 1
+
+DB_ROOT_PASS=$(whiptail --title "MariaDB" --passwordbox "MariaDB root password (leave empty to auto-generate):" 10 70 3>&1 1>&2 2>&3) || exit 1
+DB_PASS=$(whiptail --title "MariaDB" --passwordbox "RomM DB user password (leave empty to auto-generate):" 10 70 3>&1 1>&2 2>&3) || exit 1
+
+# ---------------- Ensure template downloaded ----------------
+msg "Checking Debian LXC template in '${TEMPLATE_STORE}'..."
+if ! pveam list "${TEMPLATE_STORE}" | awk '{print $1}' | grep -q "${TEMPLATE_NAME}"; then
+  msg "Template not found locally. Downloading: ${TEMPLATE_NAME}"
+  pveam download "${TEMPLATE_STORE}" "${TEMPLATE_NAME}"
+else
+  msg "Template already present: ${TEMPLATE_NAME}"
+fi
+
+# ---------------- Create CT ----------------
+msg "Creating LXC ${CTID} (${HOSTNAME})..."
+NETCFG="name=eth0,bridge=${BRIDGE},ip=${IPCFG}"
+[[ "$IPCFG" != "dhcp" && -n "$GW" ]] && NETCFG="${NETCFG},gw=${GW}"
+
+CREATE_ARGS=(
+  "${CTID}" "${TEMPLATE_STORE}:vztmpl/${TEMPLATE_NAME}"
+  --hostname "${HOSTNAME}"
+  --cores "${CORES}"
+  --memory "${MEM}"
+  --swap "${SWAP}"
+  --rootfs "${STORAGE}:${DISK}"
+  --net0 "${NETCFG}"
+  --features nesting=1,keyctl=1
+  --onboot 1
+  --start 1
+)
+if [[ "${PRIVMODE}" == "unprivileged" ]]; then
+  CREATE_ARGS+=( --unprivileged 1 )
+fi
+
+pct create "${CREATE_ARGS[@]}"
+
+# ---------------- Install Docker + docker-compose (classic) ----------------
+msg "Installing Docker + docker-compose inside the container..."
+pct exec "${CTID}" -- bash -lc "apt-get update && apt-get -y upgrade"
+pct exec "${CTID}" -- bash -lc "apt-get -y install ca-certificates curl openssl docker.io docker-compose"
+pct exec "${CTID}" -- bash -lc "systemctl enable --now docker"
+
+# ---------------- Generate secrets ----------------
+AUTH_KEY="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 32')"
+
+if [[ -z "${DB_ROOT_PASS}" ]]; then
+  DB_ROOT_PASS="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 16')"
+fi
+if [[ -z "${DB_PASS}" ]]; then
+  DB_PASS="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 16')"
+fi
+
+# ---------------- Write RomM stack ----------------
+msg "Writing RomM docker-compose stack to /opt/romm ..."
+pct exec "${CTID}" -- bash -lc "mkdir -p /opt/romm/{library,assets,config,resources,redis-data,mysql_data}"
+
+# Create .env
+pct exec "${CTID}" -- bash -lc "cat > /opt/romm/.env <<EOF
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASSWD=${DB_PASS}
+DB_ROOT_PASSWORD=${DB_ROOT_PASS}
+ROMM_AUTH_SECRET_KEY=${AUTH_KEY}
+ROMM_PORT=${ROMM_PORT}
+
+# Optional metadata providers (fill later if you want)
+IGDB_CLIENT_ID=
+IGDB_CLIENT_SECRET=
+SCREENSCRAPER_USER=
+SCREENSCRAPER_PASSWORD=
+RETROACHIEVEMENTS_API_KEY=
+MOBYGAMES_API_KEY=
+STEAMGRIDDB_API_KEY=
+HASHEOUS_API_ENABLED=true
+EOF"
+
+# Ensure config.yml exists (recommended by docs/quick start)
+pct exec "${CTID}" -- bash -lc "touch /opt/romm/config/config.yml"
+
+# Write docker-compose.yml (based on official example variables/healthcheck/volumes)
+# Use <<'EOF' to avoid host-side variable expansion and keep ${VAR} for docker-compose env substitution.
+pct exec "${CTID}" -- bash -lc "cat > /opt/romm/docker-compose.yml <<'EOF'
+version: \"3\"
+
+services:
+  romm:
+    image: rommapp/romm:latest
+    container_name: romm
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DB_HOST=romm-db
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWD=${DB_PASSWD}
+      - ROMM_AUTH_SECRET_KEY=${ROMM_AUTH_SECRET_KEY}
+
+      # Optional metadata providers
+      - IGDB_CLIENT_ID=${IGDB_CLIENT_ID}
+      - IGDB_CLIENT_SECRET=${IGDB_CLIENT_SECRET}
+      - SCREENSCRAPER_USER=${SCREENSCRAPER_USER}
+      - SCREENSCRAPER_PASSWORD=${SCREENSCRAPER_PASSWORD}
+      - RETROACHIEVEMENTS_API_KEY=${RETROACHIEVEMENTS_API_KEY}
+      - MOBYGAMES_API_KEY=${MOBYGAMES_API_KEY}
+      - STEAMGRIDDB_API_KEY=${STEAMGRIDDB_API_KEY}
+      - HASHEOUS_API_ENABLED=${HASHEOUS_API_ENABLED}
+
+    volumes:
+      - ./resources:/romm/resources
+      - ./redis-data:/redis-data
+      - ./library:/romm/library
+      - ./assets:/romm/assets
+      - ./config:/romm/config
+    ports:
+      - \"${ROMM_PORT}:8080\"
+    depends_on:
+      romm-db:
+        condition: service_healthy
+        restart: true
+
+  romm-db:
+    image: mariadb:latest
+    container_name: romm-db
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MARIADB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+      - MARIADB_DATABASE=${DB_NAME}
+      - MARIADB_USER=${DB_USER}
+      - MARIADB_PASSWORD=${DB_PASSWD}
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [\"CMD\", \"healthcheck.sh\", \"--connect\", \"--innodb_initialized\"]
+      start_period: 30s
+      start_interval: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+EOF"
+
+# ---------------- Start stack ----------------
+msg "Starting RomM with docker-compose..."
+pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker-compose up -d"
+
+CTIP="$(pct exec "${CTID}" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
+
+msg "Done ✅"
+echo "RomM URL: http://${CTIP:-<CT_IP>}:${ROMM_PORT}"
+echo "CTID/VMID: ${CTID}"
+echo "Stack path inside CT: /opt/romm"
+echo "Secrets stored in: /opt/romm/.env"
+echo "Security tip: restrict ${ROMM_PORT}/tcp via Proxmox firewall to LAN/VPN only."
+if [[ "${PRIVMODE}" == "unprivileged" ]]; then
+  echo
+  echo "NOTE: You chose an unprivileged LXC. If Docker has issues, re-create as privileged (recommended) or adjust LXC security settings."
+fi
