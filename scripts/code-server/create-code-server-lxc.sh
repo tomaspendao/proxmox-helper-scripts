@@ -3,13 +3,14 @@ set -euo pipefail
 
 # -------------------------------------------------------------------
 # Proxmox VE - Create Debian 12 LXC + Install code-server (menu-driven)
-# Features:
+# Fixes:
 #  - Auto-detect template storage that supports "vztmpl"
 #  - Auto-detect next free VMID/CTID (pvesh /cluster/nextid + fallback)
+#  - Auto-detect latest Debian 12 template name from: pveam available --section system
 # Default network: DHCP (Static optional)
 # -------------------------------------------------------------------
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -24,6 +25,7 @@ need awk
 need grep
 need sort
 need tail
+need tr
 
 if ! command -v whiptail >/dev/null 2>&1; then
   warn "whiptail is not installed on Proxmox host."
@@ -33,7 +35,6 @@ fi
 
 # --- Helpers: next free VMID/CTID ---
 get_next_id() {
-  # Best method: Proxmox cluster API
   if command -v pvesh >/dev/null 2>&1; then
     local nid
     nid="$(pvesh get /cluster/nextid 2>/dev/null | tr -d '[:space:]' || true)"
@@ -43,7 +44,6 @@ get_next_id() {
     fi
   fi
 
-  # Fallback: compute from existing IDs (CT + VM)
   local max_id=99
   if command -v pct >/dev/null 2>&1; then
     local pct_max
@@ -55,19 +55,39 @@ get_next_id() {
     qm_max="$(qm list 2>/dev/null | awk 'NR>1 {print $1}' | sort -n | tail -1 || true)"
     [[ -n "${qm_max:-}" && "${qm_max}" =~ ^[0-9]+$ ]] && (( qm_max > max_id )) && max_id=$qm_max
   fi
-
   echo $((max_id + 1))
 }
 
 is_vmid_free() {
   local id="$1"
-  # returns 0 if free, 1 if taken
   if command -v pct >/dev/null 2>&1; then
     if pct status "$id" >/dev/null 2>&1; then return 1; fi
   fi
   if command -v qm >/dev/null 2>&1; then
     if qm status "$id" >/dev/null 2>&1; then return 1; fi
   fi
+  return 0
+}
+
+# --- Helper: get latest Debian 12 template name ---
+# Uses: pveam available --section system (must match exact template filename)
+get_latest_debian12_template() {
+  # Refresh DB (fast) so we don't try old filenames
+  pveam update >/dev/null
+
+  # Extract template names for Debian 12 amd64 (zst/xz/gz) and pick latest by version sort
+  # pveam available output looks like: "system debian-12-standard_12.7-1_amd64.tar.zst"
+  local t
+  t="$(pveam available --section system 2>/dev/null \
+      | awk '{print $2}' \
+      | grep -E '^debian-12-standard_.*_amd64\.tar\.(zst|xz|gz)$' \
+      | sort -V \
+      | tail -n 1 || true)"
+
+  if [[ -z "${t}" ]]; then
+    return 1
+  fi
+  echo "${t}"
   return 0
 }
 
@@ -81,9 +101,6 @@ DEF_SWAP="512"
 DEF_DISK="12"
 DEF_STORAGE="local-lvm"          # rootfs storage (user can change in menu)
 
-# LXC template filename
-DEF_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
-
 # Static IP defaults (only used if Static selected)
 DEF_IP="192.168.1.20/24"
 DEF_GW="192.168.1.1"
@@ -95,15 +112,21 @@ DEF_PORT="8080"
 msg "Running script version: ${SCRIPT_VERSION}"
 
 # ---------------- Auto-detect template storage (vztmpl) ----------------
-# Pick the first storage that supports container templates (content: vztmpl).
 DEF_TEMPLATE_STORE="$(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 {print $1; exit}')"
 if [[ -z "${DEF_TEMPLATE_STORE}" ]]; then
   die "No storage with content 'vztmpl' found. Enable 'Container template' on a storage (e.g. local) in Datacenter -> Storage."
 fi
 
+# ---------------- Auto-detect latest Debian 12 template ----------------
+msg "Detecting latest Debian 12 LXC template via pveam available..."
+DEF_TEMPLATE="$(get_latest_debian12_template || true)"
+if [[ -z "${DEF_TEMPLATE:-}" ]]; then
+  die "Could not find a Debian 12 template in 'pveam available --section system'. Check internet/DNS and run: pveam update; pveam available --section system | grep debian-12"
+fi
+msg "Selected template: ${DEF_TEMPLATE}"
+
 # ---------------- Menus ----------------
 
-# CTID selection (AUTO or manual)
 CTID_MODE=$(whiptail --title "code-server LXC" --menu "CTID selection:" 12 70 2 \
   "auto"   "Auto-detect next free ID (recommended)" \
   "manual" "Manually enter CTID" \
@@ -156,12 +179,11 @@ BINDMODE=$(whiptail --title "code-server" --menu "Bind address:" 12 80 2 \
 
 # ---------------- Template download ----------------
 msg "Checking Debian LXC template in '${DEF_TEMPLATE_STORE}'..."
-if ! pveam list "${DEF_TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${DEF_TEMPLATE}"; then
-  msg "Template not found. Downloading: ${DEF_TEMPLATE}"
-  pveam update
+if ! pveam list "${DEF_TEMPLATE_STORE}" | awk '{print $1}' | grep -q "${DEF_TEMPLATE}"; then
+  msg "Template not found locally. Downloading: ${DEF_TEMPLATE}"
   pveam download "${DEF_TEMPLATE_STORE}" "${DEF_TEMPLATE}"
 else
-  msg "Template OK: ${DEF_TEMPLATE}"
+  msg "Template already present: ${DEF_TEMPLATE}"
 fi
 
 # ---------------- Create CT ----------------
