@@ -2,7 +2,7 @@
 
 # ------------------------------------------------------------
 # AUTO-FIX: if this file contains HTML entities (&gt; &lt; &amp; etc),
-# unescape and re-run (prevents "script does nothing" scenarios).
+# unescape and re-run. Prevents "script does nothing" scenarios.
 # ------------------------------------------------------------
 if grep -qE '&(gt|lt|amp|quot|apos|#39);' "$0" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1; then
@@ -23,7 +23,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -38,6 +38,7 @@ need grep
 need sort
 need tail
 need tr
+need mktemp
 
 if ! command -v whiptail >/dev/null 2>&1; then
   warn "whiptail is not installed on Proxmox host."
@@ -94,7 +95,7 @@ DEF_DISK="20"
 DEF_STORAGE="local-lvm"
 
 # RomM defaults
-DEF_ROMM_PORT="8081"           # external port (RomM binds 8080 internally)
+DEF_ROMM_PORT="8081"        # external port, RomM internal is 8080
 DEF_DB_NAME="romm"
 DEF_DB_USER="romm-user"
 
@@ -153,7 +154,6 @@ PRIVMODE=$(whiptail --title "Container security" --menu "Container type (Docker 
   3>&1 1>&2 2>&3) || exit 1
 
 ROMM_PORT=$(whiptail --title "RomM" --inputbox "Expose RomM on this port (external):" 10 70 "$DEF_ROMM_PORT" 3>&1 1>&2 2>&3) || exit 1
-
 DB_NAME=$(whiptail --title "Database" --inputbox "DB name:" 10 70 "$DEF_DB_NAME" 3>&1 1>&2 2>&3) || exit 1
 DB_USER=$(whiptail --title "Database" --inputbox "DB user:" 10 70 "$DEF_DB_USER" 3>&1 1>&2 2>&3) || exit 1
 
@@ -208,12 +208,15 @@ if [[ -z "${DB_PASS}" ]]; then
   DB_PASS="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 16')"
 fi
 
-# ---------------- Write RomM stack ----------------
-msg "Writing RomM docker-compose stack to /opt/romm ..."
-pct exec "${CTID}" -- bash -lc "mkdir -p /opt/romm/{library,assets,config,resources,redis-data,mysql_data}"
+# ---------------- Prepare local files (host) and pct push ----------------
+TMPDIR="$(mktemp -d)"
+cleanup() { rm -rf "${TMPDIR}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
-# Create .env
-pct exec "${CTID}" -- bash -lc "cat > /opt/romm/.env <<EOF
+ENV_FILE="${TMPDIR}/.env"
+COMPOSE_FILE="${TMPDIR}/docker-compose.yml"
+
+cat > "${ENV_FILE}" <<EOF
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASSWD=${DB_PASS}
@@ -230,15 +233,10 @@ RETROACHIEVEMENTS_API_KEY=
 MOBYGAMES_API_KEY=
 STEAMGRIDDB_API_KEY=
 HASHEOUS_API_ENABLED=true
-EOF"
+EOF
 
-# Ensure config.yml exists (recommended by docs/quick start)
-pct exec "${CTID}" -- bash -lc "touch /opt/romm/config/config.yml"
-
-# Write docker-compose.yml (based on official example variables/healthcheck/volumes)
-# Use <<'EOF' to avoid host-side variable expansion and keep ${VAR} for docker-compose env substitution.
-pct exec "${CTID}" -- bash -lc "cat > /opt/romm/docker-compose.yml <<'EOF'
-version: \"3\"
+cat > "${COMPOSE_FILE}" <<'EOF'
+version: "3"
 
 services:
   romm:
@@ -270,7 +268,7 @@ services:
       - ./assets:/romm/assets
       - ./config:/romm/config
     ports:
-      - \"${ROMM_PORT}:8080\"
+      - "${ROMM_PORT}:8080"
     depends_on:
       romm-db:
         condition: service_healthy
@@ -289,13 +287,24 @@ services:
     volumes:
       - ./mysql_data:/var/lib/mysql
     healthcheck:
-      test: [\"CMD\", \"healthcheck.sh\", \"--connect\", \"--innodb_initialized\"]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       start_period: 30s
       start_interval: 10s
       interval: 10s
       timeout: 5s
       retries: 5
-EOF"
+EOF
+
+# ---------------- Write stack inside CT ----------------
+msg "Writing RomM docker-compose stack to /opt/romm ..."
+pct exec "${CTID}" -- bash -lc "mkdir -p /opt/romm/{library,assets,config,resources,redis-data,mysql_data}"
+
+# push files (avoids all quoting/unbound-variable issues)
+pct push "${CTID}" "${ENV_FILE}" /opt/romm/.env --perms 0600
+pct push "${CTID}" "${COMPOSE_FILE}" /opt/romm/docker-compose.yml --perms 0644
+
+# ensure config.yml exists
+pct exec "${CTID}" -- bash -lc "touch /opt/romm/config/config.yml"
 
 # ---------------- Start stack ----------------
 msg "Starting RomM with docker-compose..."
