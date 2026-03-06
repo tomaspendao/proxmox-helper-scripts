@@ -2,19 +2,28 @@
 set -euo pipefail
 
 # -------------------------------------------------------------------
-# (PUBLIC) Proxmox VE - Create Debian 12 LXC + Install code-server
-# Fix: Auto-detect storage that supports LXC templates (content: vztmpl)
-# Default network: DHCP (Static optional via menu)
+# Proxmox VE - Create Debian 12 LXC + Install code-server (menu-driven)
+# Features:
+#  - Auto-detect template storage that supports "vztmpl"
+#  - Auto-detect next free VMID/CTID (pvesh /cluster/nextid + fallback)
+# Default network: DHCP (Static optional)
 # -------------------------------------------------------------------
+
+SCRIPT_VERSION="1.0.2"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
 die()  { echo -e "\n\033[1;31m[✗]\033[0m $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
+# --- Requirements on Proxmox host ---
 need pct
 need pveam
 need pvesm
+need awk
+need grep
+need sort
+need tail
 
 if ! command -v whiptail >/dev/null 2>&1; then
   warn "whiptail is not installed on Proxmox host."
@@ -22,8 +31,47 @@ if ! command -v whiptail >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- Helpers: next free VMID/CTID ---
+get_next_id() {
+  # Best method: Proxmox cluster API
+  if command -v pvesh >/dev/null 2>&1; then
+    local nid
+    nid="$(pvesh get /cluster/nextid 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "${nid}" && "${nid}" =~ ^[0-9]+$ ]]; then
+      echo "${nid}"
+      return 0
+    fi
+  fi
+
+  # Fallback: compute from existing IDs (CT + VM)
+  local max_id=99
+  if command -v pct >/dev/null 2>&1; then
+    local pct_max
+    pct_max="$(pct list 2>/dev/null | awk 'NR>1 {print $1}' | sort -n | tail -1 || true)"
+    [[ -n "${pct_max:-}" && "${pct_max}" =~ ^[0-9]+$ ]] && (( pct_max > max_id )) && max_id=$pct_max
+  fi
+  if command -v qm >/dev/null 2>&1; then
+    local qm_max
+    qm_max="$(qm list 2>/dev/null | awk 'NR>1 {print $1}' | sort -n | tail -1 || true)"
+    [[ -n "${qm_max:-}" && "${qm_max}" =~ ^[0-9]+$ ]] && (( qm_max > max_id )) && max_id=$qm_max
+  fi
+
+  echo $((max_id + 1))
+}
+
+is_vmid_free() {
+  local id="$1"
+  # returns 0 if free, 1 if taken
+  if command -v pct >/dev/null 2>&1; then
+    if pct status "$id" >/dev/null 2>&1; then return 1; fi
+  fi
+  if command -v qm >/dev/null 2>&1; then
+    if qm status "$id" >/dev/null 2>&1; then return 1; fi
+  fi
+  return 0
+}
+
 # ---------------- Defaults (PUBLIC) ----------------
-DEF_CTID="120"
 DEF_HOSTNAME="code-server"
 DEF_BRIDGE="vmbr0"
 
@@ -31,12 +79,12 @@ DEF_CORES="2"
 DEF_MEM="2048"
 DEF_SWAP="512"
 DEF_DISK="12"
-DEF_STORAGE="local-lvm"
+DEF_STORAGE="local-lvm"          # rootfs storage (user can change in menu)
 
-# Template file name (pveam uses this exact name)
+# LXC template filename
 DEF_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
 
-# Generic static defaults (only used if Static selected)
+# Static IP defaults (only used if Static selected)
 DEF_IP="192.168.1.20/24"
 DEF_GW="192.168.1.1"
 
@@ -44,17 +92,37 @@ DEF_GW="192.168.1.1"
 DEF_USER="coder"
 DEF_PORT="8080"
 
+msg "Running script version: ${SCRIPT_VERSION}"
+
 # ---------------- Auto-detect template storage (vztmpl) ----------------
 # Pick the first storage that supports container templates (content: vztmpl).
-# This avoids: "400 Parameter verification failed. template: no such template"
 DEF_TEMPLATE_STORE="$(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 {print $1; exit}')"
-
 if [[ -z "${DEF_TEMPLATE_STORE}" ]]; then
   die "No storage with content 'vztmpl' found. Enable 'Container template' on a storage (e.g. local) in Datacenter -> Storage."
 fi
 
 # ---------------- Menus ----------------
-CTID=$(whiptail --title "code-server LXC" --inputbox "CTID (Container ID):" 10 70 "$DEF_CTID" 3>&1 1>&2 2>&3) || exit 1
+
+# CTID selection (AUTO or manual)
+CTID_MODE=$(whiptail --title "code-server LXC" --menu "CTID selection:" 12 70 2 \
+  "auto"   "Auto-detect next free ID (recommended)" \
+  "manual" "Manually enter CTID" \
+  3>&1 1>&2 2>&3) || exit 1
+
+if [[ "$CTID_MODE" == "auto" ]]; then
+  CTID="$(get_next_id)"
+else
+  CTID=$(whiptail --title "code-server LXC" --inputbox "CTID (Container ID):" 10 70 "$(get_next_id)" 3>&1 1>&2 2>&3) || exit 1
+fi
+
+if ! [[ "${CTID}" =~ ^[0-9]+$ ]]; then
+  die "Invalid CTID: ${CTID}"
+fi
+if ! is_vmid_free "${CTID}"; then
+  die "CTID/VMID ${CTID} already exists. Choose another or use AUTO."
+fi
+msg "Using CTID/VMID: ${CTID}"
+
 HOSTNAME=$(whiptail --title "code-server LXC" --inputbox "Hostname:" 10 70 "$DEF_HOSTNAME" 3>&1 1>&2 2>&3) || exit 1
 BRIDGE=$(whiptail --title "Network" --inputbox "Bridge (e.g. vmbr0):" 10 70 "$DEF_BRIDGE" 3>&1 1>&2 2>&3) || exit 1
 
@@ -62,6 +130,7 @@ CORES=$(whiptail --title "Resources" --inputbox "CPU cores:" 10 70 "$DEF_CORES" 
 MEM=$(whiptail --title "Resources" --inputbox "RAM (MB):" 10 70 "$DEF_MEM" 3>&1 1>&2 2>&3) || exit 1
 SWAP=$(whiptail --title "Resources" --inputbox "SWAP (MB):" 10 70 "$DEF_SWAP" 3>&1 1>&2 2>&3) || exit 1
 DISK=$(whiptail --title "Resources" --inputbox "Disk (GB):" 10 70 "$DEF_DISK" 3>&1 1>&2 2>&3) || exit 1
+
 STORAGE=$(whiptail --title "Storage" --inputbox "Storage ID for rootfs (e.g. local-lvm/local):" 10 70 "$DEF_STORAGE" 3>&1 1>&2 2>&3) || exit 1
 
 NETMODE=$(whiptail --title "Network" --menu "IP configuration:" 12 70 2 \
@@ -85,11 +154,6 @@ BINDMODE=$(whiptail --title "code-server" --menu "Bind address:" 12 80 2 \
   "127.0.0.1" "Localhost only (reverse proxy / SSH tunnel)" \
   3>&1 1>&2 2>&3) || exit 1
 
-# ---------------- Checks ----------------
-if pct status "$CTID" >/dev/null 2>&1; then
-  die "CTID $CTID already exists. Choose another CTID."
-fi
-
 # ---------------- Template download ----------------
 msg "Checking Debian LXC template in '${DEF_TEMPLATE_STORE}'..."
 if ! pveam list "${DEF_TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${DEF_TEMPLATE}"; then
@@ -101,19 +165,19 @@ else
 fi
 
 # ---------------- Create CT ----------------
-msg "Creating LXC $CTID ($HOSTNAME)..."
+msg "Creating LXC ${CTID} (${HOSTNAME})..."
 NETCFG="name=eth0,bridge=${BRIDGE},ip=${IPCFG}"
 if [[ "$IPCFG" != "dhcp" && -n "$GW" ]]; then
   NETCFG="${NETCFG},gw=${GW}"
 fi
 
-pct create "$CTID" "${DEF_TEMPLATE_STORE}:vztmpl/${DEF_TEMPLATE}" \
-  --hostname "$HOSTNAME" \
-  --cores "$CORES" \
-  --memory "$MEM" \
-  --swap "$SWAP" \
+pct create "${CTID}" "${DEF_TEMPLATE_STORE}:vztmpl/${DEF_TEMPLATE}" \
+  --hostname "${HOSTNAME}" \
+  --cores "${CORES}" \
+  --memory "${MEM}" \
+  --swap "${SWAP}" \
   --rootfs "${STORAGE}:${DISK}" \
-  --net0 "$NETCFG" \
+  --net0 "${NETCFG}" \
   --unprivileged 1 \
   --features nesting=1,keyctl=1 \
   --onboot 1 \
@@ -121,33 +185,34 @@ pct create "$CTID" "${DEF_TEMPLATE_STORE}:vztmpl/${DEF_TEMPLATE}" \
 
 # ---------------- Bootstrap ----------------
 msg "Updating container and installing prerequisites..."
-pct exec "$CTID" -- bash -lc "apt-get update && apt-get -y upgrade"
-pct exec "$CTID" -- bash -lc "apt-get -y install curl ca-certificates sudo git"
+pct exec "${CTID}" -- bash -lc "apt-get update && apt-get -y upgrade"
+pct exec "${CTID}" -- bash -lc "apt-get -y install curl ca-certificates sudo git"
 
-msg "Creating user '$CS_USER'..."
-pct exec "$CTID" -- bash -lc "id -u $CS_USER >/dev/null 2>&1 || adduser --disabled-password --gecos '' $CS_USER"
-pct exec "$CTID" -- bash -lc "usermod -aG sudo $CS_USER"
+msg "Creating user '${CS_USER}'..."
+pct exec "${CTID}" -- bash -lc "id -u ${CS_USER} >/dev/null 2>&1 || adduser --disabled-password --gecos '' ${CS_USER}"
+pct exec "${CTID}" -- bash -lc "usermod -aG sudo ${CS_USER}"
 
 msg "Installing code-server (official installer)..."
-pct exec "$CTID" -- bash -lc "curl -fsSL https://code-server.dev/install.sh | sh"
+pct exec "${CTID}" -- bash -lc "curl -fsSL https://code-server.dev/install.sh | sh"
 
 msg "Configuring code-server..."
-pct exec "$CTID" -- bash -lc "su - $CS_USER -c 'mkdir -p ~/.config/code-server'"
+pct exec "${CTID}" -- bash -lc "su - ${CS_USER} -c 'mkdir -p ~/.config/code-server'"
 
-pct exec "$CTID" -- bash -lc "cat > /home/$CS_USER/.config/code-server/config.yaml <<EOF
+pct exec "${CTID}" -- bash -lc "cat > /home/${CS_USER}/.config/code-server/config.yaml <<EOF
 bind-addr: ${BINDMODE}:${CS_PORT}
 auth: password
 password: ${CS_PASS}
 cert: false
 EOF
-chown -R $CS_USER:$CS_USER /home/$CS_USER/.config/code-server
+chown -R ${CS_USER}:${CS_USER} /home/${CS_USER}/.config/code-server
 "
 
-msg "Enabling and starting service: code-server@$CS_USER"
-pct exec "$CTID" -- bash -lc "systemctl enable --now code-server@$CS_USER"
+msg "Enabling and starting service: code-server@${CS_USER}"
+pct exec "${CTID}" -- bash -lc "systemctl enable --now code-server@${CS_USER}"
 
-CTIP="$(pct exec "$CTID" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
+CTIP="$(pct exec "${CTID}" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
 msg "Done ✅"
 echo "Access URL: http://${CTIP:-<CT_IP>}:${CS_PORT}"
+echo "CTID/VMID: ${CTID}"
 echo "User: ${CS_USER}"
 echo "Tip: Restrict ${CS_PORT}/tcp via Proxmox firewall to LAN/VPN only."
