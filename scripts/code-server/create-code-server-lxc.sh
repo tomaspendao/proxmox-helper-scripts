@@ -3,16 +3,18 @@ set -euo pipefail
 
 # -------------------------------------------------------------------
 # (PUBLIC) Proxmox VE - Create Debian 12 LXC + Install code-server
+# Fix: Auto-detect storage that supports LXC templates (content: vztmpl)
 # Default network: DHCP (Static optional via menu)
 # -------------------------------------------------------------------
 
-msg() { echo -e "\n\033[1;32m[+]\033[0m $*"; }
+msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
-die() { echo -e "\n\033[1;31m[✗]\033[0m $*" >&2; exit 1; }
+die()  { echo -e "\n\033[1;31m[✗]\033[0m $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
 need pct
 need pveam
+need pvesm
 
 if ! command -v whiptail >/dev/null 2>&1; then
   warn "whiptail is not installed on Proxmox host."
@@ -31,7 +33,7 @@ DEF_SWAP="512"
 DEF_DISK="12"
 DEF_STORAGE="local-lvm"
 
-DEF_TEMPLATE_STORE="local"
+# Template file name (pveam uses this exact name)
 DEF_TEMPLATE="debian-12-standard_12.0-1_amd64.tar.zst"
 
 # Generic static defaults (only used if Static selected)
@@ -42,6 +44,15 @@ DEF_GW="192.168.1.1"
 DEF_USER="coder"
 DEF_PORT="8080"
 
+# ---------------- Auto-detect template storage (vztmpl) ----------------
+# Pick the first storage that supports container templates (content: vztmpl).
+# This avoids: "400 Parameter verification failed. template: no such template"
+DEF_TEMPLATE_STORE="$(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1 {print $1; exit}')"
+
+if [[ -z "${DEF_TEMPLATE_STORE}" ]]; then
+  die "No storage with content 'vztmpl' found. Enable 'Container template' on a storage (e.g. local) in Datacenter -> Storage."
+fi
+
 # ---------------- Menus ----------------
 CTID=$(whiptail --title "code-server LXC" --inputbox "CTID (Container ID):" 10 70 "$DEF_CTID" 3>&1 1>&2 2>&3) || exit 1
 HOSTNAME=$(whiptail --title "code-server LXC" --inputbox "Hostname:" 10 70 "$DEF_HOSTNAME" 3>&1 1>&2 2>&3) || exit 1
@@ -51,7 +62,7 @@ CORES=$(whiptail --title "Resources" --inputbox "CPU cores:" 10 70 "$DEF_CORES" 
 MEM=$(whiptail --title "Resources" --inputbox "RAM (MB):" 10 70 "$DEF_MEM" 3>&1 1>&2 2>&3) || exit 1
 SWAP=$(whiptail --title "Resources" --inputbox "SWAP (MB):" 10 70 "$DEF_SWAP" 3>&1 1>&2 2>&3) || exit 1
 DISK=$(whiptail --title "Resources" --inputbox "Disk (GB):" 10 70 "$DEF_DISK" 3>&1 1>&2 2>&3) || exit 1
-STORAGE=$(whiptail --title "Storage" --inputbox "Storage ID (e.g. local-lvm/local):" 10 70 "$DEF_STORAGE" 3>&1 1>&2 2>&3) || exit 1
+STORAGE=$(whiptail --title "Storage" --inputbox "Storage ID for rootfs (e.g. local-lvm/local):" 10 70 "$DEF_STORAGE" 3>&1 1>&2 2>&3) || exit 1
 
 NETMODE=$(whiptail --title "Network" --menu "IP configuration:" 12 70 2 \
   "dhcp"   "Use DHCP (default)" \
@@ -79,14 +90,14 @@ if pct status "$CTID" >/dev/null 2>&1; then
   die "CTID $CTID already exists. Choose another CTID."
 fi
 
-# ---------------- Template ----------------
-msg "Checking Debian LXC template in '$DEF_TEMPLATE_STORE'..."
-if ! pveam list "$DEF_TEMPLATE_STORE" | awk '{print $2}' | grep -qx "$DEF_TEMPLATE"; then
-  msg "Template not found. Downloading: $DEF_TEMPLATE"
+# ---------------- Template download ----------------
+msg "Checking Debian LXC template in '${DEF_TEMPLATE_STORE}'..."
+if ! pveam list "${DEF_TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${DEF_TEMPLATE}"; then
+  msg "Template not found. Downloading: ${DEF_TEMPLATE}"
   pveam update
-  pveam download "$DEF_TEMPLATE_STORE" "$DEF_TEMPLATE"
+  pveam download "${DEF_TEMPLATE_STORE}" "${DEF_TEMPLATE}"
 else
-  msg "Template OK: $DEF_TEMPLATE"
+  msg "Template OK: ${DEF_TEMPLATE}"
 fi
 
 # ---------------- Create CT ----------------
