@@ -1,1 +1,9 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.bak
 
+# Logs
+*.log
