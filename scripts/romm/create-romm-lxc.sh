@@ -244,7 +244,7 @@ ROMM_PORT=${ROMM_PORT}
 EOF"
 
 msg "Starting RomM with docker compose..."
-pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker compose up -d"
+pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker-compose up -d"
 
 CTIP="$(pct exec "${CTID}" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
 
