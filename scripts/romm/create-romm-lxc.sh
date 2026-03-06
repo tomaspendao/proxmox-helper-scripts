@@ -171,7 +171,7 @@ pct create "${CREATE_ARGS[@]}"
 # ---------------- Install Docker & deploy RomM ----------------
 msg "Installing Docker + Compose inside the container..."
 pct exec "${CTID}" -- bash -lc "apt-get update && apt-get -y upgrade"
-pct exec "${CTID}" -- bash -lc "apt-get -y install ca-certificates curl openssl docker.io docker-compose-plugin"
+pct exec "${CTID}" -- bash -lc "apt-get -y install ca-certificates curl openssl docker.io docker-compose"
 
 pct exec "${CTID}" -- bash -lc "systemctl enable --now docker"
 
