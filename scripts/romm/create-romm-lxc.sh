@@ -15,7 +15,6 @@ print(html.unescape(data))
 PY
     exit $?
   else
-    # minimal fallback for common entities
     sed -e 's/&gt;/>/g' -e 's/&lt;/</g' -e 's/&amp;/\&/g' "$0" | bash
     exit $?
   fi
@@ -23,7 +22,7 @@ fi
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -94,7 +93,6 @@ DEF_SWAP="512"
 DEF_DISK="20"
 DEF_STORAGE="local-lvm"
 
-# RomM defaults
 DEF_ROMM_PORT="8081"        # external port, RomM internal is 8080
 DEF_DB_NAME="romm"
 DEF_DB_USER="romm-user"
@@ -199,8 +197,7 @@ pct exec "${CTID}" -- bash -lc "apt-get -y install ca-certificates curl openssl 
 pct exec "${CTID}" -- bash -lc "systemctl enable --now docker"
 
 # ---------------- Generate secrets ----------------
-AUTH_KEY="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 32')"
-
+AUTH_KEY="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 32')"  # recommended [2](https://docs.romm.app/4.5.0/Getting-Started/Quick-Start-Guide/)
 if [[ -z "${DB_ROOT_PASS}" ]]; then
   DB_ROOT_PASS="$(pct exec "${CTID}" -- bash -lc 'openssl rand -hex 16')"
 fi
@@ -235,6 +232,9 @@ STEAMGRIDDB_API_KEY=
 HASHEOUS_API_ENABLED=true
 EOF
 
+# Compose v1.29 compatible:
+# - no start_interval
+# - depends_on is simple list; we will start DB first and wait for health before starting RomM
 cat > "${COMPOSE_FILE}" <<'EOF'
 version: "3"
 
@@ -251,7 +251,6 @@ services:
       - DB_PASSWD=${DB_PASSWD}
       - ROMM_AUTH_SECRET_KEY=${ROMM_AUTH_SECRET_KEY}
 
-      # Optional metadata providers
       - IGDB_CLIENT_ID=${IGDB_CLIENT_ID}
       - IGDB_CLIENT_SECRET=${IGDB_CLIENT_SECRET}
       - SCREENSCRAPER_USER=${SCREENSCRAPER_USER}
@@ -270,9 +269,7 @@ services:
     ports:
       - "${ROMM_PORT}:8080"
     depends_on:
-      romm-db:
-        condition: service_healthy
-        restart: true
+      - romm-db
 
   romm-db:
     image: mariadb:latest
@@ -289,7 +286,6 @@ services:
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       start_period: 30s
-      start_interval: 10s
       interval: 10s
       timeout: 5s
       retries: 5
@@ -298,17 +294,33 @@ EOF
 # ---------------- Write stack inside CT ----------------
 msg "Writing RomM docker-compose stack to /opt/romm ..."
 pct exec "${CTID}" -- bash -lc "mkdir -p /opt/romm/{library,assets,config,resources,redis-data,mysql_data}"
-
-# push files (avoids all quoting/unbound-variable issues)
 pct push "${CTID}" "${ENV_FILE}" /opt/romm/.env --perms 0600
 pct push "${CTID}" "${COMPOSE_FILE}" /opt/romm/docker-compose.yml --perms 0644
-
-# ensure config.yml exists
 pct exec "${CTID}" -- bash -lc "touch /opt/romm/config/config.yml"
 
-# ---------------- Start stack ----------------
-msg "Starting RomM with docker-compose..."
-pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker-compose up -d"
+# ---------------- Start stack (DB first, wait healthy, then RomM) ----------------
+msg "Starting RomM database first..."
+pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker-compose up -d romm-db"
+
+msg "Waiting for romm-db to become healthy..."
+pct exec "${CTID}" -- bash -lc '
+set -e
+for i in $(seq 1 90); do
+  status=$(docker inspect -f "{{.State.Health.Status}}" romm-db 2>/dev/null || echo "starting")
+  if [ "$status" = "healthy" ]; then
+    echo "[+] romm-db is healthy"
+    exit 0
+  fi
+  echo "[*] romm-db status: $status (try $i/90)"
+  sleep 2
+done
+echo "[!] romm-db did not become healthy in time"
+docker logs --tail=80 romm-db || true
+exit 1
+'
+
+msg "Starting RomM application..."
+pct exec "${CTID}" -- bash -lc "cd /opt/romm && docker-compose up -d romm"
 
 CTIP="$(pct exec "${CTID}" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
 
