@@ -25,3 +25,4 @@ Opcionalmente, podes ativar **upload** do resultado (gera link público do Geekb
 ```bash
 chmod +x create-geekbench6-lxc.sh
 ./create-geekbench6-lxc.sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/tomaspendao/proxmox-helper-scripts/main/scripts/geekbench6/create-geekbench6-lxc.sh)"
