@@ -43,3 +43,4 @@ Proxmox VE
    └─ Docker
       ├─ romm      (rommapp/romm)
       └─ romm-db   (MariaDB)
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/tomaspendao/proxmox-helper-scripts/main/scripts/romm/create-romm-lxc.sh)"
