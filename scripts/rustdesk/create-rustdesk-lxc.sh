@@ -39,7 +39,7 @@ set -euo pipefail
 # Reference: https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/docker/
 # -------------------------------------------------------------------
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -224,6 +224,33 @@ if [[ "${PRIVMODE}" == "unprivileged" ]]; then
 fi
 
 pct create "${CREATE_ARGS[@]}"
+
+# ---------------- Grant /dev/net/tun access (required for Tailscale) ----------------
+# Without this, tailscaled installs fine but fails to start inside the LXC
+# ("open /dev/net/tun: no such file or directory"). This must be set on the
+# Proxmox host, in the container's config file, not from inside the LXC.
+if [[ "${INSTALL_TS}" == "yes" ]]; then
+  msg "Granting /dev/net/tun access to the LXC (required for Tailscale)..."
+  CTCONF="/etc/pve/lxc/${CTID}.conf"
+  if [[ -f "${CTCONF}" ]]; then
+    grep -q "^lxc.cgroup2.devices.allow: c 10:200 rwm" "${CTCONF}" 2>/dev/null || \
+      echo "lxc.cgroup2.devices.allow: c 10:200 rwm" >> "${CTCONF}"
+    grep -q "^lxc.mount.entry: /dev/net dev/net none bind" "${CTCONF}" 2>/dev/null || \
+      echo "lxc.mount.entry: /dev/net dev/net none bind,create=dir 0.0" >> "${CTCONF}"
+
+    msg "Restarting the LXC to apply /dev/net/tun access..."
+    pct stop "${CTID}"
+    pct start "${CTID}"
+    # Give the container a few seconds to bring networking back up before pct exec calls
+    sleep 5
+  else
+    warn "Could not find ${CTCONF} to grant /dev/net/tun access. Tailscale may fail to start."
+    warn "Fix manually on the Proxmox host with:"
+    echo "  echo 'lxc.cgroup2.devices.allow: c 10:200 rwm' >> /etc/pve/lxc/${CTID}.conf"
+    echo "  echo 'lxc.mount.entry: /dev/net dev/net none bind,create=dir 0.0' >> /etc/pve/lxc/${CTID}.conf"
+    echo "  pct stop ${CTID} && pct start ${CTID}"
+  fi
+fi
 
 # ---------------- Install Docker + docker-compose (classic) ----------------
 msg "Installing Docker + docker-compose inside the container..."
