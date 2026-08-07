@@ -39,7 +39,7 @@ set -euo pipefail
 # Reference: https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/docker/
 # -------------------------------------------------------------------
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -343,10 +343,14 @@ msg "Starting hbbs (ID/rendezvous server)..."
 pct exec "${CTID}" -- bash -lc "cd /opt/rustdesk && docker-compose up -d hbbs"
 
 # ---------------- Wait for keypair and read public key ----------------
+# NOTE: we read the key straight from the bind-mounted ./data dir on the LXC
+# (/opt/rustdesk/data/id_ed25519.pub), NOT via 'docker exec hbbs cat ...' -
+# the rustdesk-server image is minimal and doesn't ship a 'cat' binary,
+# which makes 'docker exec' fail with "executable file not found in $PATH".
 msg "Waiting for hbbs to generate its keypair..."
 PUBKEY=""
 for i in $(seq 1 30); do
-  PUBKEY="$(pct exec "${CTID}" -- bash -lc "docker exec hbbs cat /root/id_ed25519.pub 2>/dev/null" || true)"
+  PUBKEY="$(pct exec "${CTID}" -- bash -lc "cat /opt/rustdesk/data/id_ed25519.pub 2>/dev/null" || true)"
   [[ -n "${PUBKEY}" ]] && break
   sleep 2
 done
@@ -365,7 +369,7 @@ if [[ -n "${PUBKEY}" ]]; then
   echo "  ${PUBKEY}"
 else
   warn "Could not read the public key yet. Retrieve it later with:"
-  echo "  pct exec ${CTID} -- docker exec hbbs cat /root/id_ed25519.pub"
+  echo "  pct exec ${CTID} -- cat /opt/rustdesk/data/id_ed25519.pub"
 fi
 echo
 if [[ "${RELAY_MODE}" == "tailscale" ]]; then
