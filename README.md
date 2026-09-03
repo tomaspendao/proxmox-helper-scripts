@@ -36,3 +36,12 @@ Install on Proxmox host:
 
 ```bash
 apt update && apt install -y whiptail
+
+
+---
+
+## Planned scripts
+
+- **nginx-proxy-manager** — replacing Caddy as the reverse proxy on the jump host; GUI-based hostname management.
+- **homepage** — replacing Homarr as the dashboard; lighter on resources, faster shutdown.
+- **stirling-pdf**, **immich**, **wazuh**, **beszel**, **paperless-ngx** — under evaluation.
