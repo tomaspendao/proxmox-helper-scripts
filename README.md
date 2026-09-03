@@ -36,6 +36,7 @@ Install on Proxmox host:
 
 ```bash
 apt update && apt install -y whiptail
+```
 
 
 ---
