@@ -13,7 +13,7 @@ set -euo pipefail
 # Upstream: https://github.com/rorygallagher2024/lg-webos-dashboard
 # -------------------------------------------------------------------
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 msg()  { echo -e "\n\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\n\033[1;33m[!]\033[0m $*"; }
@@ -232,11 +232,13 @@ case \"\${1:-}\" in
   *)       usage; [ -n \"\${1:-}\" ] && exit 2 || exit 0 ;;
 esac
 WRAP
-chmod 755 /usr/local/bin/glasshouse"
+chmod 755 /usr/local/bin/glasshouse
+# pct exec / pct enter shells may not have /usr/local/bin in PATH
+ln -sf /usr/local/bin/glasshouse /usr/bin/glasshouse"
 
 PUBKEY="$(pct exec "${CTID}" -- cat /root/.ssh/id_ed25519.pub)"
 CTIP="$(pct exec "${CTID}" -- bash -lc "hostname -I | awk '{print \$1}'" || true)"
-UPSTREAM="$(pct exec "${CTID}" -- glasshouse version || true)"
+UPSTREAM="$(pct exec "${CTID}" -- /usr/local/bin/glasshouse version || true)"
 
 msg "Done ✅"
 echo "CTID/VMID: ${CTID}"
